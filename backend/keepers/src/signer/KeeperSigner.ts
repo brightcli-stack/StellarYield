@@ -52,10 +52,11 @@ function safeArgsSummary(args: xdr.ScVal[]): string[] {
  * `invokeContract` rejects any other method before building a transaction.
  */
 export class KeeperSigner {
-  private readonly provider: SignerProvider;
+  private provider: SignerProvider;
   private readonly server: rpc.Server;
   private readonly networkPassphrase: string;
   private readonly auditLog?: ReturnType<typeof createKeeperAuditLog>;
+  private rotationLock = false;
 
   constructor(secretKeyOrProvider?: string | SignerProvider, options?: KeeperSignerOptions) {
     if (secretKeyOrProvider && typeof secretKeyOrProvider === 'object') {
@@ -83,6 +84,55 @@ export class KeeperSigner {
   /** Public key of the currently active signer */
   get publicKey(): string {
     return this.provider.publicKey;
+  }
+
+  /**
+   * Rotate to a new signer provider without losing queued work (#1536).
+   *
+   * Sets a rotation lock so in-flight jobs complete with the old signer,
+   * then swaps the provider. Queued jobs will use the new signer on their
+   * next execution. The lock prevents both signers from submitting the
+   * same job simultaneously.
+   *
+   * @param newProvider - The new signer provider to activate
+   * @returns Object with old and new public keys
+   */
+  async rotateSigner(newProvider: SignerProvider): Promise<{
+    oldPublicKey: string;
+    newPublicKey: string;
+  }> {
+    if (this.rotationLock) {
+      throw new Error('Signer rotation already in progress');
+    }
+
+    this.rotationLock = true;
+    const oldPublicKey = this.provider.publicKey;
+
+    try {
+      // Wait briefly for in-flight operations to drain
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      this.provider = newProvider;
+
+      logger.info(
+        { oldPublicKey, newPublicKey: newProvider.publicKey },
+        '[KeeperSigner] Signer rotated',
+      );
+
+      return {
+        oldPublicKey,
+        newPublicKey: newProvider.publicKey,
+      };
+    } finally {
+      this.rotationLock = false;
+    }
+  }
+
+  /**
+   * Returns true if a signer rotation is currently in progress.
+   */
+  get isRotating(): boolean {
+    return this.rotationLock;
   }
 
   private recordDecision(

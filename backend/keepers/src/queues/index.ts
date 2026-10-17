@@ -182,6 +182,126 @@ export async function quarantineJob(
   }
 }
 
+// ── Dead-letter queue (#1537) ──────────────────────────────────────────────
+
+const DEAD_LETTER_PREFIX = 'keeper:dead-letter:';
+
+export interface DeadLetterEntry {
+  id: string;
+  queueName: string;
+  jobData: Record<string, unknown>;
+  failureReason: string;
+  failedAttempts: number;
+  firstFailedAt: string;
+  lastFailedAt: string;
+  error?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Move a permanently failed job to the dead-letter queue with full failure
+ * context for operator inspection and manual replay (#1537).
+ */
+export async function moveToDeadLetter(
+  queueName: string,
+  jobId: string,
+  jobData: Record<string, unknown>,
+  failureReason: string,
+  failedAttempts: number,
+  error?: string,
+): Promise<void> {
+  try {
+    const redis = getRedis();
+    const entry: DeadLetterEntry = {
+      id: jobId,
+      queueName,
+      jobData,
+      failureReason,
+      failedAttempts,
+      firstFailedAt: new Date().toISOString(),
+      lastFailedAt: new Date().toISOString(),
+      error,
+    };
+    const key = `${DEAD_LETTER_PREFIX}${queueName}:${jobId}`;
+    await redis.setex(key, 30 * 24 * 60 * 60, JSON.stringify(entry)); // 30-day TTL
+    // Also add to a sorted set for listing
+    await redis.zadd(`${DEAD_LETTER_PREFIX}index`, Date.now(), key);
+    logger.warn({ queueName, jobId, failureReason }, 'Job moved to dead-letter queue');
+  } catch (err) {
+    logger.error({ err, queueName, jobId }, 'Failed to move job to dead-letter queue');
+  }
+}
+
+/**
+ * List dead-letter entries, optionally filtered by queue name (#1537).
+ */
+export async function listDeadLetter(
+  queueName?: string,
+  limit = 50,
+): Promise<DeadLetterEntry[]> {
+  try {
+    const redis = getRedis();
+    const pattern = queueName
+      ? `${DEAD_LETTER_PREFIX}${queueName}:*`
+      : `${DEAD_LETTER_PREFIX}*`;
+    const keys = await redis.keys(pattern);
+    const entries: DeadLetterEntry[] = [];
+    for (const key of keys.slice(0, limit)) {
+      const raw = await redis.get(key);
+      if (raw) entries.push(JSON.parse(raw) as DeadLetterEntry);
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Inspect a single dead-letter entry (#1537).
+ */
+export async function inspectDeadLetter(
+  queueName: string,
+  jobId: string,
+): Promise<DeadLetterEntry | null> {
+  try {
+    const redis = getRedis();
+    const raw = await redis.get(`${DEAD_LETTER_PREFIX}${queueName}:${jobId}`);
+    return raw ? (JSON.parse(raw) as DeadLetterEntry) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Manually replay a dead-letter entry back into its original queue (#1537).
+ * Removes the entry from the dead-letter store after successful re-enqueue.
+ */
+export async function replayDeadLetter(
+  queueName: string,
+  jobId: string,
+): Promise<boolean> {
+  try {
+    const entry = await inspectDeadLetter(queueName, jobId);
+    if (!entry) return false;
+
+    const queue = new Queue(queueName, { connection: getRedis() });
+    await queue.add(`replay:${jobId}`, entry.jobData, {
+      attempts: config.keeper.jobMaxAttempts,
+      backoff: { type: 'exponential', delay: 5_000 },
+    });
+
+    const redis = getRedis();
+    await redis.del(`${DEAD_LETTER_PREFIX}${queueName}:${jobId}`);
+    await redis.zrem(`${DEAD_LETTER_PREFIX}index`, `${DEAD_LETTER_PREFIX}${queueName}:${jobId}`);
+
+    logger.info({ queueName, jobId }, 'Dead-letter job replayed');
+    return true;
+  } catch (err) {
+    logger.error({ err, queueName, jobId }, 'Failed to replay dead-letter job');
+    return false;
+  }
+}
+
 /**
  * BullMQ Queue for liquidation jobs.
  * Each job carries the account address and position snapshot that triggered it.
